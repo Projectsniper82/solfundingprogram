@@ -1,7 +1,15 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  /* config options here */
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  transpilePackages: [
+    "@jup-ag/core",
+    "@jup-ag/react-hook",
+    "@solana/web3.js",
+    "@solana/wallet-adapter-react",
+    "@solana/wallet-adapter-wallets",
+    "@solana/wallet-adapter-base",
+    "@solana/wallet-adapter-react-ui"
+  ]
 };
 
-export default nextConfig;
+module.exports = nextConfig;
+
