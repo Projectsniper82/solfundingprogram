@@ -5,213 +5,65 @@ import {
   LAMPORTS_PER_SOL,
   SystemProgram,
   Transaction,
+  sendAndConfirmTransaction,
+  TransactionInstruction,
 } from "@solana/web3.js";
+// CORRECTED IMPORTS for @solana/spl-token v0.4+
+import { 
+    createAssociatedTokenAccountInstruction, 
+    createTransferInstruction, 
+    getAssociatedTokenAddress 
+} from "@solana/spl-token";
 
-export type WalletNode = {
-  keypair: Keypair | null;
-  pubkey: PublicKey;
-  label: string;
-  id: string;
-};
-
-export type FundingPlanStep = {
-  from: string; // node id
-  to: string;   // node id
-  amount: number;
-  sendTime: number; // seconds since start
-};
-
-export type FundingGraph = {
-  nodes: WalletNode[];
-  edges: FundingPlanStep[];
-  fundingSource: Keypair | null;
-  fundingSourcePubkey: PublicKey;
-  recipients: PublicKey[];
-};
-
-function makeId() {
-  return Math.random().toString(36).substring(2, 10);
-}
-
-export async function getSolanaTxFee(
-  connection: Connection,
-  from: PublicKey,
-  to: PublicKey
-): Promise<number> {
-  const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: from,
-      toPubkey: to,
-      lamports: 1,
-    })
-  );
-  tx.feePayer = from;
-  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-
-  const message = tx.compileMessage();
-  const feeResp = await connection.getFeeForMessage(message);
-  if (!feeResp.value) throw new Error("Unable to fetch fee from getFeeForMessage");
-  return feeResp.value;
-}
-
+// ... rest of the file is unchanged ...
+const SOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
+const USDC_MINT = new PublicKey("Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr");
+const SOL_USDC_POOL_ID = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqbAaGgG9pKFVEaA";
+export type WalletNode = { keypair: Keypair | null; pubkey: PublicKey; label: string; id: string; };
+export type FundingPlanStep = { type: 'sol-transfer' | 'swap' | 'token-transfer'; from: string; to: string; amount: number; amountInLamports?: bigint; sendTime: number; poolId?: string; inputMint?: string; outputMint?: string; tokenMint?: string; };
+export type FundingGraph = { nodes: WalletNode[]; edges: FundingPlanStep[]; fundingSource: Keypair | null; fundingSourcePubkey: PublicKey; recipients: PublicKey[]; };
+function makeId() { return Math.random().toString(36).substring(2, 10); }
 
 export async function buildFundingGraph(
   connection: Connection,
   fundingSource: Keypair | null,
   fundingSourcePubkey: PublicKey,
-  recipients: PublicKey[], // Expects 6 bot wallets
+  recipients: PublicKey[],
   totalSol: number,
   totalSeconds: number
 ): Promise<FundingGraph> {
-  
-  const NUM_LAYER_1_HUBS = 2;
-  const NUM_LAYER_2_DISTRIBUTORS = 4;
+  const NUM_INTERMEDIATE = 3;
   const intermediateWallets: WalletNode[] = [];
-
-  for (let i = 0; i < NUM_LAYER_1_HUBS + NUM_LAYER_2_DISTRIBUTORS; i++) {
-    const kp = Keypair.generate();
-    intermediateWallets.push({
-      keypair: kp,
-      pubkey: kp.publicKey,
-      label: i < NUM_LAYER_1_HUBS ? `Hub ${i + 1}` : `Distributor ${i - NUM_LAYER_1_HUBS + 1}`,
-      id: makeId(),
-    });
-  }
-
-  const recipientNodes: WalletNode[] = recipients.map((pubkey, idx) => ({
-    keypair: null,
-    pubkey,
-    label: `Bot Wallet ${idx + 1}`,
-    id: "RECIPIENT_" + idx,
-  }));
-
-  const sourceNode: WalletNode = {
-    keypair: fundingSource,
-    pubkey: fundingSourcePubkey,
-    label: "Source",
-    id: "SOURCE",
-  };
-  
-  const txFeeLamports = 5000;
-  const txFeeSOL = txFeeLamports / LAMPORTS_PER_SOL;
-  
-  const rentExemptionLamports = await connection.getMinimumBalanceForRentExemption(0);
-  const rentExemptionSOL = rentExemptionLamports / LAMPORTS_PER_SOL;
-
-  const totalTransactions = NUM_LAYER_1_HUBS + NUM_LAYER_2_DISTRIBUTORS + recipients.length;
-  const totalFees = totalTransactions * txFeeSOL;
-  const totalRent = (NUM_LAYER_1_HUBS + NUM_LAYER_2_DISTRIBUTORS) * rentExemptionSOL;
+  for (let i = 0; i < NUM_INTERMEDIATE; i++) { const kp = Keypair.generate(); intermediateWallets.push({ keypair: kp, pubkey: kp.publicKey, label: `Mixer Wallet ${i + 1}`, id: makeId(), }); }
+  const recipientNodes: WalletNode[] = recipients.map((pubkey, idx) => ({ keypair: null, pubkey, label: `Bot Wallet ${idx + 1}`, id: "RECIPIENT_" + idx }));
+  const sourceNode: WalletNode = { keypair: fundingSource, pubkey: fundingSourcePubkey, label: "Source", id: "SOURCE" };
+  const txFeeSOL = 5000 / LAMPORTS_PER_SOL;
+  const swapFeeSOL = txFeeSOL * 4;
+  const rentExemptionSOL = (await connection.getMinimumBalanceForRentExemption(0)) / LAMPORTS_PER_SOL;
+  const totalFees = (txFeeSOL * (1 + recipients.length)) + (swapFeeSOL * 2) + txFeeSOL;
+  const totalRent = rentExemptionSOL * (NUM_INTERMEDIATE + 2);
   const totalCost = totalFees + totalRent;
-
-  if (totalSol <= totalCost) {
-    throw new Error(`Deposit of ${totalSol} SOL is not enough to cover fees (${totalFees}) and rent (${totalRent}). Total cost: ${totalCost}`);
-  }
-
+  if (totalSol <= totalCost) { throw new Error(`Deposit of ${totalSol} SOL is not enough. At least ${totalCost.toFixed(4)} is needed.`); }
   const amountToDistribute = totalSol - totalCost;
-  const recipientAmounts = randomSplit(amountToDistribute, recipients.length);
-  
+  const finalAmounts = randomSplit(amountToDistribute, recipients.length);
   const edges: FundingPlanStep[] = [];
-  const hubs = intermediateWallets.slice(0, NUM_LAYER_1_HUBS);
-  const distributors = intermediateWallets.slice(NUM_LAYER_1_HUBS);
-
-  const distributorRecipientAssignments: { [distId: string]: { node: WalletNode, amount: number }[] } = {};
-  distributors.forEach(d => distributorRecipientAssignments[d.id] = []);
-  recipients.forEach((r, i) => distributorRecipientAssignments[distributors[i % NUM_LAYER_2_DISTRIBUTORS].id].push({ node: recipientNodes[i], amount: recipientAmounts[i] }));
-  
-  const hubDistributorAssignments: { [hubId: string]: WalletNode[] } = {};
-  hubs.forEach(h => hubDistributorAssignments[h.id] = []);
-  distributors.forEach((d, i) => hubDistributorAssignments[hubs[i % NUM_LAYER_1_HUBS].id].push(d));
-
-  // CORRECTED LOGIC
-  // Stage 1: Source -> Hubs
-  hubs.forEach(hub => {
-    let amountToFundHub = 0;
-    // This hub needs to pay fees to fund its distributors
-    amountToFundHub += hubDistributorAssignments[hub.id].length * txFeeSOL;
-
-    hubDistributorAssignments[hub.id].forEach(dist => {
-      // It also needs to send the distributors enough for rent, future fees, and the final amounts
-      amountToFundHub += rentExemptionSOL; // Rent for the distributor
-      const assignedRecipients = distributorRecipientAssignments[dist.id];
-      amountToFundHub += assignedRecipients.length * txFeeSOL; // Fees for final transfers
-      amountToFundHub += assignedRecipients.reduce((sum, r) => sum + r.amount, 0); // Final amounts
-    });
-
-    if (amountToFundHub > 0) {
-      edges.push({
-        from: sourceNode.id, to: hub.id, amount: amountToFundHub,
-        sendTime: Math.floor(Math.random() * totalSeconds * 0.2)
-      });
-    }
-  });
-
-  // Stage 2: Hubs -> Distributors
-  hubs.forEach(hub => {
-    hubDistributorAssignments[hub.id].forEach(dist => {
-      const assignedRecipients = distributorRecipientAssignments[dist.id];
-      const totalForRecipients = assignedRecipients.reduce((sum, r) => sum + r.amount, 0);
-      const feesForNextStage = assignedRecipients.length * txFeeSOL;
-      const amountToFundDistributor = totalForRecipients + feesForNextStage;
-
-      if (amountToFundDistributor > 0) {
-        edges.push({
-          from: hub.id, to: dist.id, amount: amountToFundDistributor,
-          sendTime: Math.floor(totalSeconds * 0.2 + Math.random() * totalSeconds * 0.3)
-        });
-      }
-    });
-  });
-
-  // Stage 3: Distributors -> Recipients
-  distributors.forEach(dist => {
-    distributorRecipientAssignments[dist.id].forEach(recipient => {
-      edges.push({
-        from: dist.id, to: recipient.node.id, amount: recipient.amount,
-        sendTime: Math.floor(totalSeconds * 0.5 + Math.random() * totalSeconds * 0.5)
-      });
-    });
-  });
-  
+  const [mixer1, mixer2, mixer3] = intermediateWallets;
+  const initialFundingAmount = amountToDistribute + (swapFeeSOL * 2) + (txFeeSOL * (1 + recipients.length)) + (rentExemptionSOL * (NUM_INTERMEDIATE - 1 + 2));
+  edges.push({ type: 'sol-transfer', from: sourceNode.id, to: mixer1.id, amount: initialFundingAmount, sendTime: totalSeconds * 0.05 });
+  edges.push({ type: 'swap', from: mixer1.id, to: mixer1.id, amount: 0, amountInLamports: BigInt(Math.floor(amountToDistribute * LAMPORTS_PER_SOL)), sendTime: totalSeconds * 0.25, poolId: SOL_USDC_POOL_ID, inputMint: SOL_MINT.toBase58(), outputMint: USDC_MINT.toBase58(), });
+  edges.push({ type: 'token-transfer', from: mixer1.id, to: mixer2.id, amount: 0, tokenMint: USDC_MINT.toBase58(), sendTime: totalSeconds * 0.45 });
+  edges.push({ type: 'swap', from: mixer2.id, to: mixer2.id, amount: 0, amountInLamports: BigInt(0), sendTime: totalSeconds * 0.65, poolId: SOL_USDC_POOL_ID, inputMint: USDC_MINT.toBase58(), outputMint: SOL_MINT.toBase58(), });
+  edges.push({ type: 'sol-transfer', from: mixer2.id, to: mixer3.id, amount: 0, sendTime: totalSeconds * 0.85 });
+  let cumulativeDelay = totalSeconds * 0.90;
+  finalAmounts.forEach((finalAmount, i) => { if (finalAmount > 0) { edges.push({ type: 'sol-transfer', from: mixer3.id, to: recipientNodes[i].id, amount: finalAmount, sendTime: cumulativeDelay }); cumulativeDelay += (totalSeconds * 0.1) / recipients.length; } });
   edges.sort((a, b) => a.sendTime - b.sendTime);
-
-  return {
-    nodes: [sourceNode, ...intermediateWallets, ...recipientNodes],
-    edges,
-    fundingSource,
-    fundingSourcePubkey,
-    recipients,
-  };
+  return { nodes: [sourceNode, ...intermediateWallets, ...recipientNodes], edges, fundingSource, fundingSourcePubkey, recipients, };
 }
 
 function randomSplit(total: number, n: number): number[] {
-  if (n <= 0 || total <= 0) return [];
-  if (n === 1) return [total];
-
-  const equalShare = total / n;
-  // Variation: Each wallet's amount can vary by up to 30% (+/- 15%) from the equal share.
-  // You can adjust this percentage to make the amounts more or less similar.
-  const variationPercentage = 0.30; 
-
-  let initialShares = Array(n).fill(0).map(() => {
-    const jitter = (Math.random() - 0.5) * variationPercentage; // -0.15 to +0.15
-    return equalShare * (1 + jitter);
-  });
-
-  // Normalize the shares to ensure their sum is exactly equal to the total amount.
-  const currentTotal = initialShares.reduce((sum, val) => sum + val, 0);
-  const normalizationFactor = total / currentTotal;
-  
-  const finalShares = initialShares.map(share => share * normalizationFactor);
-  
-  return finalShares;
+  if (n <= 0 || total <= 0) return []; if (n === 1) return [total]; const equalShare = total / n; const variationPercentage = 0.30; let initialShares = Array(n).fill(0).map(() => { const jitter = (Math.random() - 0.5) * variationPercentage; return equalShare * (1 + jitter); }); const currentTotal = initialShares.reduce((sum, val) => sum + val, 0); const normalizationFactor = total / currentTotal; return initialShares.map(share => share * normalizationFactor);
 }
 
-function randomSample<T>(arr: T[], n: number): T[] {
-  let copy = [...arr];
-  let out: T[] = [];
-  for (let i = 0; i < n && copy.length > 0; i++) {
-    let idx = Math.floor(Math.random() * copy.length);
-    out.push(copy.splice(idx, 1)[0]);
-  }
-  return out;
+export async function sendSplToken(connection: Connection, from: Keypair, to: PublicKey, tokenMint: PublicKey) {
+    const fromAta = await getAssociatedTokenAddress(tokenMint, from.publicKey); const toAta = await getAssociatedTokenAddress(tokenMint, to); const balance = await connection.getTokenAccountBalance(fromAta); const amountLamports = BigInt(balance.value.amount); if (amountLamports === BigInt(0)) { console.log("No token balance to send."); return; } const toAtaInfo = await connection.getAccountInfo(toAta); const instructions: TransactionInstruction[] = []; if (!toAtaInfo) { instructions.push(createAssociatedTokenAccountInstruction(from.publicKey, toAta, to, tokenMint)); } instructions.push(createTransferInstruction(fromAta, toAta, from.publicKey, amountLamports)); const tx = new Transaction().add(...instructions); tx.feePayer = from.publicKey; tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash; return await sendAndConfirmTransaction(connection, tx, [from]);
 }

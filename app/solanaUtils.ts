@@ -1,115 +1,43 @@
-import {
-  Keypair,
-  Connection,
-  LAMPORTS_PER_SOL,
-  PublicKey,
-  Transaction,
-  SystemProgram,
-  sendAndConfirmTransaction,
-  SendTransactionError,
-} from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
+// CORRECTED: Filename is all lowercase
+import { swapRaydiumTokens } from './raydiumsdkadapter.js'; 
+import BN from 'bn.js';
 
-// Generate a new random wallet
-export function createNewWallet(): Keypair {
-  return Keypair.generate();
-}
-
-// Airdrop SOL to a wallet (Devnet only)
-export async function airdropSol(
-  connection: Connection,
-  pubkey: PublicKey,
-  amount: number
-) {
-  const sig = await connection.requestAirdrop(
-    pubkey,
-    amount * LAMPORTS_PER_SOL
-  );
-  await connection.confirmTransaction(sig, "confirmed");
-}
-
-// Get wallet balance (in SOL)
-export async function getBalance(
-  connection: Connection,
-  pubkey: PublicKey
-): Promise<number> {
-  const lamports = await connection.getBalance(pubkey);
-  return lamports / LAMPORTS_PER_SOL;
-}
-
-export async function sendSol(
-  connection: Connection,
-  from: Keypair,
-  to: PublicKey,
-  amount: number
-): Promise<string> {
-  try {
-    if (amount <= 0) throw new Error("Amount must be greater than 0.");
-    const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
-    if (lamports <= 0) throw new Error("Amount is too small to be sent.");
-
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: from.publicKey,
-        toPubkey: to,
-        lamports,
-      })
-    );
-    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-    tx.feePayer = from.publicKey;
-
-    return await sendAndConfirmTransaction(connection, tx, [from]);
-  } catch (err) {
-    if (err instanceof SendTransactionError) {
-      console.error("Solana Transaction Error:", await err.getLogs(connection));
+class KeypairWalletAdapter {
+    private keypair: Keypair;
+    constructor(keypair: Keypair) { this.keypair = keypair; }
+    get publicKey(): PublicKey { return this.keypair.publicKey; }
+    async signTransaction<T extends Transaction | VersionedTransaction>(tx: T): Promise<T> {
+        if (tx instanceof VersionedTransaction) { tx.sign([this.keypair]); } 
+        else if (tx instanceof Transaction) { tx.partialSign(this.keypair); }
+        return tx;
     }
-    throw err;
-  }
+    async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> {
+        return txs.map((t) => {
+            if (t instanceof VersionedTransaction) { t.sign([this.keypair]); } 
+            else if (t instanceof Transaction) { t.partialSign(this.keypair); }
+            return t;
+        });
+    }
 }
 
-/**
- * Sweeps the entire SOL balance of an account to a recipient, minus the transaction fee.
- * @param connection The Solana connection object.
- * @param from The Keypair of the account to sweep.
- * @param to The PublicKey of the recipient.
- * @returns A promise that resolves with the transaction signature and amount swept, or null if the balance was too low.
- */
-export async function sweepSol(
+export async function executeSwap(
     connection: Connection,
-    from: Keypair,
-    to: PublicKey
-): Promise<{signature: string | null, amount: number}> {
-    const balance = await connection.getBalance(from.publicKey);
-    
-    // Estimate the fee (5000 lamports is a safe default for a simple transfer)
-    const fee = 5000;
-
-    // Only proceed if the balance is greater than the fee
-    if (balance <= fee) {
-        return { signature: null, amount: 0 };
-    }
-
-    const amountToSend = balance - fee;
-
+    walletKeypair: Keypair,
+    poolId: string, 
+    inputMint: string, 
+    amountIn: BN, 
+    slippage: number = 0.01 
+) {
+    const wallet = new KeypairWalletAdapter(walletKeypair);
+    console.log(`Executing swap on Raydium for pool ${poolId}`);
     try {
-        const tx = new Transaction().add(
-            SystemProgram.transfer({
-                fromPubkey: from.publicKey,
-                toPubkey: to,
-                lamports: amountToSend,
-            })
+        const signature = await swapRaydiumTokens(
+            wallet, connection, poolId, inputMint, amountIn, slippage
         );
-        tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-        tx.feePayer = from.publicKey;
-
-        const signature = await sendAndConfirmTransaction(connection, tx, [from]);
-        return { signature, amount: amountToSend / LAMPORTS_PER_SOL };
-    } catch (err) {
-        if (err instanceof SendTransactionError) {
-            console.error(`Sweep failed for ${from.publicKey.toBase58()}. Logs:`, await err.getLogs(connection));
-        }
-        throw err;
+        return signature;
+    } catch (error) {
+        console.error("Error during swap execution:", error);
+        throw error;
     }
 }
-
-
-
